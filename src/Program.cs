@@ -4,10 +4,11 @@ using System.Windows.Forms;
 
 [assembly: AssemblyTitle("WipeFilter")]
 [assembly: AssemblyProduct("WipeFilter")]
+[assembly: AssemblyDescription("Filtre de couleurs et viseur pour Rust - https://wipefilter.fr")]
 [assembly: AssemblyCompany("WipeFilter.fr")]
 [assembly: AssemblyCopyright("WipeFilter.fr")]
-[assembly: AssemblyVersion("4.1.0.0")]
-[assembly: AssemblyFileVersion("4.1.0.0")]
+[assembly: AssemblyVersion("4.1.1.0")]
+[assembly: AssemblyFileVersion("4.1.1.0")]
 
 namespace RustFilter
 {
