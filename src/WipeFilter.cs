@@ -20,11 +20,25 @@ namespace RustFilter
         [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr hWnd, IntPtr hdc);
         [DllImport("gdi32.dll")] public static extern bool SetDeviceGammaRamp(IntPtr hdc, ushort[] ramp);
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+        public struct DISPLAY_DEVICE
+        {
+            public int cb;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+            public int StateFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+        }
+        [DllImport("user32.dll", CharSet = CharSet.Ansi)] public static extern bool EnumDisplayDevices(string lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
+        [DllImport("gdi32.dll", CharSet = CharSet.Ansi)] public static extern IntPtr CreateDC(string lpszDriver, string lpszDevice, string lpszOutput, IntPtr lpInitData);
+        [DllImport("gdi32.dll")] public static extern bool DeleteDC(IntPtr hdc);
         [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint mods, uint vk);
         [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
         [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
     }
 
@@ -84,14 +98,16 @@ namespace RustFilter
                 err += "Couche couleur refusee (code " + Marshal.GetLastWin32Error() + "). ";
 
             double gm = on ? s.Gamma / 100.0 : 1.0;
+            if (lastGamma < 0 && gm == 1.0) lastGamma = 1.0; // gamma neutre au démarrage : rien à écrire, donc rien à refuser
             if (gm != lastGamma)
             {
                 if (SetGamma(gm)) lastGamma = gm;
-                else err += "Gamma refuse par Windows (baisse le gamma). ";
+                else if (gm != 1.0) err += "Le gamma n'est pas disponible sur cet écran : le reste du filtre fonctionne. ";
             }
             return err;
         }
 
+        // Applique la rampe de gamma sur chaque écran actif (et pas seulement sur l'écran virtuel).
         public static bool SetGamma(double gm)
         {
             ushort[] ramp = new ushort[768];
@@ -103,9 +119,26 @@ namespace RustFilter
                 ushort u = (ushort)v;
                 ramp[i] = u; ramp[256 + i] = u; ramp[512 + i] = u;
             }
-            IntPtr dc = Native.GetDC(IntPtr.Zero);
-            bool ok = Native.SetDeviceGammaRamp(dc, ramp);
-            Native.ReleaseDC(IntPtr.Zero, dc);
+            bool any = false;
+            try
+            {
+                for (uint i = 0; i < 16; i++)
+                {
+                    Native.DISPLAY_DEVICE dd = new Native.DISPLAY_DEVICE();
+                    dd.cb = Marshal.SizeOf(typeof(Native.DISPLAY_DEVICE));
+                    if (!Native.EnumDisplayDevices(null, i, ref dd, 0)) break;
+                    if ((dd.StateFlags & 0x1) == 0) continue; // écran non relié au bureau
+                    IntPtr dc = Native.CreateDC("DISPLAY", dd.DeviceName, null, IntPtr.Zero);
+                    if (dc == IntPtr.Zero) continue;
+                    if (Native.SetDeviceGammaRamp(dc, ramp)) any = true;
+                    Native.DeleteDC(dc);
+                }
+            }
+            catch { }
+            if (any) return true;
+            IntPtr sdc = Native.GetDC(IntPtr.Zero); // repli : écran virtuel
+            bool ok = Native.SetDeviceGammaRamp(sdc, ramp);
+            Native.ReleaseDC(IntPtr.Zero, sdc);
             return ok;
         }
 
@@ -115,7 +148,7 @@ namespace RustFilter
             float[] m = new float[25];
             m[0] = 1; m[6] = 1; m[12] = 1; m[18] = 1; m[24] = 1;
             Native.MagSetFullscreenColorEffect(m);
-            SetGamma(1.0);
+            if (lastGamma != 1.0) SetGamma(1.0); // on ne remet le gamma que s'il a été modifié
             lastGamma = 1.0;
         }
     }
@@ -125,6 +158,7 @@ namespace RustFilter
     {
         public bool On = false, Outline = true;
         public int Style = 2, Argb = Color.FromArgb(0, 255, 120).ToArgb(), Size = 6, Thick = 2, Gap = 3, OffX = 0, OffY = 0;
+        public int AlphaPct { get { int a = Color.FromArgb(Argb).A; return a == 0 ? 100 : (int)Math.Round(a / 2.55); } }
         public string Ser()
         {
             return (On ? 1 : 0) + ";" + Style + ";" + Argb + ";" + Size + ";" + Thick + ";" + Gap + ";" + (Outline ? 1 : 0) + ";" + OffX + ";" + OffY;
@@ -185,6 +219,7 @@ namespace RustFilter
             Rectangle sb = Screen.PrimaryScreen.Bounds;
             Location = new Point(sb.Left + sb.Width / 2 - S / 2 + c.OffX, sb.Top + sb.Height / 2 - S / 2 + c.OffY);
             Size = new Size(S, S);
+            Opacity = Math.Max(0.1, c.AlphaPct / 100.0); // opacité de tout le viseur (contour compris)
             if (c.On && !Visible && !App.TestMode) Show();
             if (!c.On && Visible) Hide();
             Invalidate();
@@ -362,7 +397,7 @@ namespace RustFilter
             StartPosition = FormStartPosition.CenterScreen;
             TopMost = true; MinimizeBox = false; MaximizeBox = false;
             ClientSize = new Size(360, 120);
-            BackColor = Color.FromArgb(18, 18, 22); ForeColor = Color.White;
+            BackColor = Theme.Card; ForeColor = Theme.Fg;
             Font = new Font("Segoe UI", 10f);
             lbl = new Label();
             lbl.SetBounds(16, 14, 330, 50);
@@ -498,9 +533,13 @@ namespace RustFilter
         int myPid;
 
         ModernSlider tBright, tContrast, tSat, tGamma, tR, tG, tB;
-        ModernSlider cSize, cThick, cGap, cOffX, cOffY;
+        ModernSlider cSize, cThick, cGap, cOffX, cOffY, cOpa;
+        Label stChip;
+        SceneThumb[] thumbs;
         ToggleSwitch chkOn, chkCross, chkOutline, chkAuto, chkOsd;
-        ComboBox cbProf, cbStyle, cbGameProf, cbPreset, cbRes;
+        ComboBox cbProf, cbStyle, cbGameProf, cbRes;
+        CrossCfg[] presetCfgs;
+        PresetTile[] presetTiles;
         TextBox tbExe;
         ListBox lbGames, lbBinds;
         Label status, lblRes, titleLbl, subLbl;
@@ -517,9 +556,10 @@ namespace RustFilter
         List<DEVMODE> modes = new List<DEVMODE>();
         EventHandler displayChanged;
 
-        static readonly string[] PageTitles = new string[] { "Couleurs", "Viseur", "Touches", "Jeux", "Résolution" };
+        static readonly string[] PageTitles = new string[] { "Couleurs", "Filtres", "Viseur", "Touches", "Jeux", "Résolution" };
         static readonly string[] PageSubs = new string[] {
             "Règle les filtres de couleur en temps réel.",
+            "Dix filtres prêts à l'emploi : nuit, désert, neige, forêt, PvP.",
             "Crée ton viseur, vois-le en direct et partage-le avec un code.",
             "Choisis tes raccourcis clavier.",
             "Un profil différent selon le jeu.",
@@ -539,7 +579,7 @@ namespace RustFilter
             MaximizeBox = false;
             BackColor = Theme.Bg; ForeColor = Theme.Fg;
             Font = new Font("Segoe UI", 9.5f);
-            ClientSize = new Size(800, 660);
+            ClientSize = new Size(800, 700);
             StartPosition = FormStartPosition.CenterScreen;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { Icon = SystemIcons.Application; }
             KeyPreview = true;
@@ -547,17 +587,17 @@ namespace RustFilter
 
             // --- barre latérale ---
             Panel side = new Panel();
-            side.SetBounds(0, 0, 200, 660);
+            side.SetBounds(0, 0, 200, 700);
             side.BackColor = Theme.Side;
             Controls.Add(side);
             LogoLabel logo = new LogoLabel();
             logo.Location = new Point(22, 24);
             side.Controls.Add(logo);
-            Label ver = MakeLabel(side, "v4.1  ·  wipefilter.fr", 24, 62, 160, Theme.Dim);
+            Label ver = MakeLabel(side, "v4.8  ·  wipefilter.fr", 24, 62, 160, Theme.Dim);
             ver.Font = new Font("Segoe UI", 8.5f);
 
-            navs = new NavButton[5];
-            for (int i = 0; i < 5; i++)
+            navs = new NavButton[6];
+            for (int i = 0; i < 6; i++)
             {
                 int idx = i;
                 NavButton nb = new NavButton();
@@ -568,79 +608,120 @@ namespace RustFilter
                 navs[i] = nb;
             }
 
-            chkOn = MakeCheck(side, "Filtre actif", 22, 530, 170);
+            chkOn = MakeCheck(side, "Filtre actif", 22, 570, 170);
             chkOn.Checked = true;
             chkOn.CheckedChanged += delegate { ApplyNow(); };
-            MakeButton(side, "Réduire dans la barre", 20, 576, 160).Click += delegate { HideToTray(); };
+            MakeButton(side, "Réduire dans la barre", 20, 616, 160).Click += delegate { HideToTray(); };
 
             // --- en-tête ---
-            titleLbl = MakeLabel(this, "", 232, 22, 536, Theme.Fg);
-            titleLbl.Font = new Font("Segoe UI", 20f, FontStyle.Bold);
+            titleLbl = MakeLabel(this, "", 232, 22, 360, Theme.Fg);
+            stChip = MakeLabel(this, "", 596, 32, 172, Theme.Ok);
+            stChip.TextAlign = ContentAlignment.MiddleRight;
+            stChip.Font = new Font("Segoe UI Semibold", 9.5f);
+            titleLbl.Font = Theme.Display(26f);
             titleLbl.Height = 38;
             subLbl = MakeLabel(this, "", 232, 62, 536, Theme.Dim);
 
             // --- pages ---
-            pages = new Panel[5];
-            for (int i = 0; i < 5; i++)
+            pages = new Panel[6];
+            for (int i = 0; i < 6; i++)
             {
-                Panel p = new Panel();
-                p.SetBounds(232, 100, 536, 520);
+                Panel p = new PagePanel();
+                p.SetBounds(232, 100, 536, 560);
                 p.BackColor = Theme.Bg;
                 Controls.Add(p);
                 pages[i] = p;
             }
-            status = MakeLabel(this, "", 232, 626, 536, Theme.Dim);
+            status = MakeLabel(this, "", 232, 666, 536, Theme.Dim);
             status.Height = 26;
 
             // --- Couleurs ---
             Panel pCol = pages[0];
-            CardPanel c1 = Card(pCol, 0, 0, 536, 292);
-            int y = 14;
+            tSat      = AddTile(pCol, 0, 0, 262, 124, "Saturation", 0, 300, 100, "%", ColorChanged);
+            tContrast = AddTile(pCol, 274, 0, 262, 124, "Contraste", 50, 200, 100, "%", ColorChanged);
+
+            CardPanel c1 = Card(pCol, 0, 136, 536, 214);
+            int y = 12;
             tBright   = AddSlider(c1, "Luminosité", -50, 50, 0, ref y, "{0:+0;-0;0}", ColorChanged);
-            tContrast = AddSlider(c1, "Contraste", 50, 200, 100, ref y, "{0}%", ColorChanged);
-            tSat      = AddSlider(c1, "Saturation", 0, 300, 100, ref y, "{0}%", ColorChanged);
             tGamma    = AddSlider(c1, "Gamma", 50, 200, 100, ref y, "g", ColorChanged);
             tR        = AddSlider(c1, "Rouge", 50, 150, 100, ref y, "{0}%", ColorChanged);
             tG        = AddSlider(c1, "Vert", 50, 150, 100, ref y, "{0}%", ColorChanged);
             tB        = AddSlider(c1, "Bleu", 50, 150, 100, ref y, "{0}%", ColorChanged);
 
-            CardPanel c2 = Card(pCol, 0, 304, 536, 156);
-            int y2 = 16;
+            CardPanel c2 = Card(pCol, 0, 362, 536, 106);
+            int y2 = 12;
             MakeLabel(c2, "Profil", 18, y2 + 5, 60, Theme.Dim);
             cbProf = MakeCombo(c2, 80, y2 + 2, 226);
             cbProf.SelectedIndexChanged += delegate { if (!loading) LoadProfile(cbProf.Text, false); };
+            tips.SetToolTip(cbProf, "Pour créer un filtre : règle les curseurs, écris un nom ici, clique sur Sauver. Double-clic sur un curseur = valeur par défaut.");
             MakeButton(c2, "Sauver", 316, y2, 94, true).Click += delegate { SaveProfile(); };
             MakeButton(c2, "Supprimer", 418, y2, 100).Click += delegate { DeleteProfile(); };
             y2 += 46;
             MakeButton(c2, "Copier le code", 18, y2, 160).Click += delegate { CopyFilterCode(); };
             MakeButton(c2, "Coller un code", 186, y2, 160).Click += delegate { ImportCode(); };
             MakeButton(c2, "Réinitialiser", 354, y2, 164).Click += delegate { SetSliders(new Settings()); ApplyNow(); };
-            y2 += 46;
-            Label hc = MakeLabel(c2, "Pour créer un filtre : règle les curseurs, écris un nom dans « Profil », clique sur Sauver.\nDouble-clic sur un curseur = valeur par défaut.", 18, y2, 500, Theme.Dim);
-            hc.Height = 40; hc.Font = new Font("Segoe UI", 8.75f);
+            Label tipCol = MakeLabel(pCol, "Astuce : choisis un filtre prêt à l'emploi dans l'onglet Filtres, puis ajuste-le ici.", 0, 482, 536, Theme.Dim);
+            tipCol.Font = new Font("Segoe UI", 8.75f);
+
+            // --- Filtres : la gamme prête à l'emploi ---
+            Panel pFil = pages[1];
+            CardPanel gp = Card(pFil, 0, 0, 536, 366);
+            Label hgal = MakeLabel(gp, "Gamme de filtres", 18, 8, 300, Theme.Dim);
+            hgal.Font = new Font("Segoe UI", 9f);
+            thumbs = new SceneThumb[Gallery.Length];
+            for (int i = 0; i < Gallery.Length; i++)
+            {
+                FilterPreset fp = Gallery[i];
+                SceneThumb th = new SceneThumb();
+                th.Caption = fp.Name; th.Preset = fp.S; th.Kind = fp.Kind;
+                th.SetBounds(14 + (i % 4) * 126, 32 + (i / 4) * 108, 120, 100);
+                th.Click += delegate { SetSliders(fp.S); autoPaused = false; ApplyNow(); ShowFilterDesc(fp); };
+                th.MouseEnter += delegate { ShowFilterDesc(fp); };
+                th.MouseLeave += delegate { ShowFilterDesc(CurrentFilter()); };
+                gp.Controls.Add(th);
+                thumbs[i] = th;
+            }
+            CardPanel dp = Card(pFil, 0, 378, 536, 92);
+            filtTitle = MakeLabel(dp, "", 18, 10, 500, Theme.Fg);
+            filtTitle.Font = Theme.Display(18f); filtTitle.Height = 30;
+            filtDesc = MakeLabel(dp, "", 18, 44, 500, Theme.Dim);
+            filtDesc.Height = 40;
+            Label noteF = MakeLabel(pFil, "Aperçu approximatif : le rendu réel dépend de ton écran. Un filtre s'applique tout de suite et reste modifiable dans l'onglet Couleurs.", 0, 482, 536, Theme.Dim);
+            noteF.Height = 40; noteF.Font = new Font("Segoe UI", 8.75f);
+            ShowFilterDesc(Gallery[0]);
 
             // --- Viseur ---
-            Panel pCross = pages[1];
-            CardPanel top = Card(pCross, 0, 0, 536, 258);
+            Panel pCross = pages[2];
+            CardPanel top = Card(pCross, 0, 0, 536, 218);
             preview = new CrossPreview();
             preview.Location = new Point(10, 8);
             top.Controls.Add(preview);
             tips.SetToolTip(preview, "Clique pour changer le décor de l'aperçu");
-            int rx = 270;
-            chkCross = MakeCheck(top, "Afficher le viseur", rx, 10, 250);
+            int rx = 226;
+            chkCross = MakeCheck(top, "Afficher le viseur", rx, 8, 290);
             chkCross.CheckedChanged += delegate { CrossChanged(); };
-            MakeLabel(top, "Preset", rx, 44, 120, Theme.Dim).Font = new Font("Segoe UI", 8.75f);
-            cbPreset = MakeCombo(top, rx, 64, 250);
-            cbPreset.DropDownStyle = ComboBoxStyle.DropDownList;
-            ((DarkCombo)cbPreset).Placeholder = "Choisir un preset…";
-            cbPreset.Items.AddRange(new object[] { "Classique vert", "Point rouge", "Croix cyan fine", "Cercle jaune", "T blanc", "Petit point blanc", "Croix rose large" });
-            cbPreset.SelectedIndexChanged += delegate { ApplyPreset(cbPreset.SelectedIndex); };
-            MakeLabel(top, "Style", rx, 100, 120, Theme.Dim).Font = new Font("Segoe UI", 8.75f);
-            cbStyle = MakeCombo(top, rx, 120, 250);
+            SmallLabel(top, "Préréglages", rx, 42, 200);
+            presetCfgs = BuildPresets();
+            presetTiles = new PresetTile[presetCfgs.Length];
+            for (int i = 0; i < presetCfgs.Length; i++)
+            {
+                int idx = i;
+                PresetTile pt = new PresetTile();
+                pt.Cfg = presetCfgs[i];
+                pt.SetBounds(rx + (i % 4) * 74, 64 + (i / 4) * 76, 68, 68);
+                pt.Click += delegate { ApplyPreset(idx); };
+                tips.SetToolTip(pt, PresetNames[i]);
+                top.Controls.Add(pt);
+                presetTiles[i] = pt;
+            }
+
+            // style et couleur sur une seule ligne
+            CardPanel sty = Card(pCross, 0, 226, 536, 56);
+            cbStyle = MakeCombo(sty, 14, 14, 150);
             cbStyle.DropDownStyle = ComboBoxStyle.DropDownList;
             cbStyle.Items.AddRange(new object[] { "Point", "Croix", "Croix + point", "Cercle + point", "T" });
             cbStyle.SelectedIndexChanged += delegate { CrossChanged(); };
-            MakeLabel(top, "Couleur", rx, 156, 120, Theme.Dim).Font = new Font("Segoe UI", 8.75f);
+            tips.SetToolTip(cbStyle, "Style du viseur");
             Color[] quick = new Color[] {
                 Color.FromArgb(0, 255, 120), Color.FromArgb(255, 40, 40), Color.FromArgb(0, 230, 255), Color.FromArgb(255, 220, 0),
                 Color.White, Color.FromArgb(255, 80, 200), Color.FromArgb(255, 140, 0), Color.FromArgb(170, 110, 255) };
@@ -649,30 +730,32 @@ namespace RustFilter
                 Color qc = quick[i];
                 ColorChip chip = new ColorChip();
                 chip.Value = qc;
-                chip.Location = new Point(rx + i * 32, 178);
+                chip.Location = new Point(178 + i * 29, 15);
                 chip.Click += delegate { crossArgb = qc.ToArgb(); CrossChanged(); };
-                top.Controls.Add(chip);
+                sty.Controls.Add(chip);
             }
-            bColor = MakeButton(top, "Couleur perso…", rx, 214, 120);
+            bColor = MakeButton(sty, "Perso…", 418, 12, 104);
             bColor.Click += delegate { PickColor(); };
-            MakeButton(top, "Code Rust (F1)", rx + 128, 214, 122).Click += delegate { CopyNativeCrossCode(); };
-            tips.SetToolTip(top.Controls[top.Controls.Count - 1], "Copie la commande crosshair.load_code à coller dans la console de Rust (F1)");
 
-            CardPanel bot = Card(pCross, 0, 268, 536, 250);
-            y = 10;
-            cSize  = AddSlider(bot, "Taille", 1, 40, 6, ref y, "{0}px", CrossChanged);
-            cThick = AddSlider(bot, "Épaisseur", 1, 8, 2, ref y, "{0}px", CrossChanged);
-            cGap   = AddSlider(bot, "Écart", 0, 20, 3, ref y, "{0}px", CrossChanged);
-            cOffX  = AddSlider(bot, "Décalage X", -60, 60, 0, ref y, "{0}", CrossChanged);
-            cOffY  = AddSlider(bot, "Décalage Y", -60, 60, 0, ref y, "{0}", CrossChanged);
-            chkOutline = MakeCheck(bot, "Contour noir", 18, y + 8, 220);
+            CardPanel bot = Card(pCross, 0, 292, 536, 266);
+            y = 8;
+            cSize  = AddSlider(bot, "Taille", 1, 40, 6, ref y, "{0}px", CrossChanged); y -= 4;
+            cThick = AddSlider(bot, "Épaisseur", 1, 8, 2, ref y, "{0}px", CrossChanged); y -= 4;
+            cGap   = AddSlider(bot, "Écart", 0, 20, 3, ref y, "{0}px", CrossChanged); y -= 4;
+            cOffX  = AddSlider(bot, "Décalage X", -60, 60, 0, ref y, "{0}", CrossChanged); y -= 4;
+            cOffY  = AddSlider(bot, "Décalage Y", -60, 60, 0, ref y, "{0}", CrossChanged); y -= 4;
+            cOpa   = AddSlider(bot, "Opacité", 10, 100, 100, ref y, "{0}%", CrossChanged); y -= 4;
+            chkOutline = MakeCheck(bot, "Contour noir", 18, y + 8, 160);
             chkOutline.Checked = true;
             chkOutline.CheckedChanged += delegate { CrossChanged(); };
-            MakeButton(bot, "Copier le code", 252, y + 4, 128).Click += delegate { CopyCrossCode(); };
-            MakeButton(bot, "Coller un code", 388, y + 4, 130).Click += delegate { ImportCode(); };
+            MakeButton(bot, "Copier le code", 188, y + 4, 108).Click += delegate { CopyCrossCode(); };
+            MakeButton(bot, "Coller un code", 302, y + 4, 108).Click += delegate { ImportCode(); };
+            RoundButton bRust = MakeButton(bot, "Code Rust (F1)", 416, y + 4, 106);
+            bRust.Click += delegate { CopyNativeCrossCode(); };
+            tips.SetToolTip(bRust, "Copie la commande crosshair.load_code à coller dans la console de Rust (F1)");
 
             // --- Touches ---
-            Panel pKeys = pages[2];
+            Panel pKeys = pages[3];
             MakeLabel(pKeys, "Choisis une action, puis clique sur « Changer la touche ».", 0, 0, 536, Theme.Fg);
             CardPanel kc = Card(pKeys, 0, 30, 536, 300);
             lbBinds = new ListBox();
@@ -690,7 +773,7 @@ namespace RustFilter
             chkOsd.CheckedChanged += delegate { SaveConfig(); };
 
             // --- Jeux ---
-            Panel pGames = pages[3];
+            Panel pGames = pages[4];
             chkAuto = MakeCheck(pGames, "Changer de profil automatiquement selon le jeu", 0, 0, 520);
             chkAuto.CheckedChanged += delegate { autoProfile = null; SaveConfig(); if (!chkAuto.Checked && autoPaused) { autoPaused = false; ApplyNow(); } };
             CardPanel gc = Card(pGames, 0, 40, 536, 68);
@@ -713,7 +796,7 @@ namespace RustFilter
             hg.Height = 62; hg.Font = new Font("Segoe UI", 8.75f);
 
             // --- Résolution ---
-            Panel pRes = pages[4];
+            Panel pRes = pages[5];
             CardPanel rc = Card(pRes, 0, 0, 536, 146);
             lblRes = MakeLabel(rc, "", 18, 16, 500, Theme.Fg);
             lblRes.Font = new Font("Segoe UI Semibold", 10.5f);
@@ -769,9 +852,33 @@ namespace RustFilter
         public void Snapshot(string path)
         {
             Bitmap b = new Bitmap(Width, Height);
-            if (Visible) { using (Graphics gg = Graphics.FromImage(b)) gg.CopyFromScreen(Left, Top, 0, 0, new Size(Width, Height)); }
+            if (Visible)
+            {
+                // Capture d'écran seulement si CETTE fenêtre est au premier plan (sinon on photographierait un autre programme).
+                bool front = false;
+                for (int k = 0; k < 20 && !front; k++)
+                {
+                    TopMost = true; Activate(); BringToFront(); Application.DoEvents(); Thread.Sleep(150);
+                    front = Native.GetForegroundWindow() == Handle;
+                }
+                using (Graphics gg = Graphics.FromImage(b))
+                {
+                    if (front) gg.CopyFromScreen(Left, Top, 0, 0, new Size(Width, Height));
+                    else
+                    {
+                        // repli : PrintWindow ne capture que cette fenêtre, même masquée
+                        IntPtr hdc = gg.GetHdc();
+                        try { Native.PrintWindow(Handle, hdc, 2); } finally { gg.ReleaseHdc(hdc); }
+                    }
+                }
+                TopMost = false;
+            }
             else DrawToBitmap(b, new Rectangle(0, 0, Width, Height));
-            b.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+            // on ne garde que l'intérieur de la fenêtre (pas la barre de titre ni les bords)
+            Rectangle cr = RectangleToScreen(ClientRectangle);
+            int ox = Math.Max(0, cr.X - Left), oy = Math.Max(0, cr.Y - Top);
+            using (Bitmap inner = b.Clone(new Rectangle(ox, oy, Math.Min(ClientSize.Width, b.Width - ox), Math.Min(ClientSize.Height, b.Height - oy)), b.PixelFormat))
+                inner.Save(path, System.Drawing.Imaging.ImageFormat.Png);
             b.Dispose();
         }
 
@@ -791,8 +898,16 @@ namespace RustFilter
             Label l = new Label();
             l.Text = text; l.ForeColor = c;
             l.AutoSize = false;
+            if (parent is MainForm || parent is PagePanel) l.BackColor = Color.Transparent; // laisse voir le dégradé
             l.SetBounds(x, y, w, 22);
             parent.Controls.Add(l);
+            return l;
+        }
+
+        Label SmallLabel(Control parent, string text, int x, int y, int w)
+        {
+            Label l = MakeLabel(parent, text, x, y, w, Theme.Dim);
+            l.Height = 18; l.Font = new Font("Segoe UI", 8.75f);
             return l;
         }
 
@@ -844,11 +959,96 @@ namespace RustFilter
             if (e.Index < 0) return;
             bool sel = (e.State & DrawItemState.Selected) != 0;
             Graphics g = e.Graphics;
-            using (SolidBrush b = new SolidBrush(sel ? Color.FromArgb(52, 34, 32) : Theme.Card)) g.FillRectangle(b, e.Bounds);
+            using (SolidBrush b = new SolidBrush(sel ? Color.FromArgb(62, 38, 34) : Theme.Card)) g.FillRectangle(b, e.Bounds);
             if (sel) using (SolidBrush b = new SolidBrush(Theme.Accent)) g.FillRectangle(b, e.Bounds.X, e.Bounds.Y + 4, 3, e.Bounds.Height - 8);
             TextRenderer.DrawText(g, lb.Items[e.Index].ToString(), lb.Font,
                 new Rectangle(e.Bounds.X + 12, e.Bounds.Y, e.Bounds.Width - 12, e.Bounds.Height), Theme.Fg,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+        }
+
+        // ---- Gamme de filtres prêts à l'emploi (valeurs : luminosité, contraste, saturation, gamma, rouge, vert, bleu) ----
+        public class FilterPreset
+        {
+            public string Name, Title, Desc, Kind; public Settings S;
+            public FilterPreset(string name, string title, string desc, string kind, int br, int co, int sa, int ga, int r, int g, int b)
+            { Name = name; Title = title; Desc = desc; Kind = kind; S = Settings.Make(br, co, sa, ga, r, g, b); }
+        }
+
+        public static readonly FilterPreset[] Gallery = new FilterPreset[] {
+            new FilterPreset("Normal", "Normal", "Retour aux réglages d'origine, sans aucun filtre.", "day", 0, 100, 100, 100, 100, 100, 100),
+            new FilterPreset("Nuit", "Nuit · bases et intérieurs", "Plus de lumière dans les bases et les intérieurs, sans délaver l'image.", "night", 6, 105, 120, 125, 104, 100, 92),
+            new FilterPreset("Nuit noire", "Nuit noire · sans lune", "Relève fortement les ombres quand il fait vraiment sombre. Si Windows refuse le gamma, baisse-le dans Couleurs.", "deepnight", 16, 108, 112, 135, 104, 102, 96),
+            new FilterPreset("Grotte", "Grotte et bunker", "Tunnels, grottes et monuments sombres : les détails restent visibles dans le noir.", "cave", 12, 106, 118, 132, 102, 100, 96),
+            new FilterPreset("Désert", "Désert · anti-éblouissement", "Réduit l'éblouissement du sable et du ciel clair, et garde les silhouettes nettes.", "desert", -8, 118, 118, 92, 97, 99, 106),
+            new FilterPreset("Neige", "Neige · anti-éblouissement", "Atténue le blanc de la neige et renforce le contraste pour repérer les joueurs.", "snow", -14, 122, 108, 88, 98, 100, 105),
+            new FilterPreset("Forêt", "Forêt · joueurs visibles", "Fait ressortir les silhouettes dans la végétation.", "forest", 0, 112, 140, 105, 104, 96, 100),
+            new FilterPreset("Jour vif", "Jour vif", "Contraste et saturation relevés pour l'extérieur, en plein jour.", "day", 0, 110, 150, 100, 100, 100, 100),
+            new FilterPreset("Soleil couchant", "Coucher de soleil", "Équilibre les oranges et les ombres des fins de journée.", "sunset", 3, 108, 125, 110, 98, 100, 104),
+            new FilterPreset("Brouillard", "Brouillard et pluie", "Retire le voile gris : plus de contraste et de saturation sous la pluie ou dans la brume.", "fog", 4, 124, 125, 112, 100, 100, 104),
+            new FilterPreset("PvP", "PvP · silhouettes", "Contraste marqué pour détacher les joueurs du décor, de jour comme de nuit.", "pvp", 0, 128, 118, 106, 100, 100, 100) };
+
+        Label filtTitle, filtDesc;
+
+        FilterPreset CurrentFilter()
+        {
+            string cur = Read().Ser();
+            foreach (FilterPreset fp in Gallery) if (fp.S.Ser() == cur) return fp;
+            return null;
+        }
+
+        void ShowFilterDesc(FilterPreset fp)
+        {
+            if (filtTitle == null) return;
+            if (fp == null) { filtTitle.Text = "Réglages personnalisés"; filtDesc.Text = "Tu as modifié les curseurs. Sauvegarde-les comme profil dans l'onglet Couleurs."; }
+            else { filtTitle.Text = fp.Title; filtDesc.Text = fp.Desc; }
+        }
+
+        void UpdateThumbs()
+        {
+            if (thumbs == null) return;
+            string cur = Read().Ser();
+            foreach (SceneThumb t in thumbs)
+            {
+                bool sel = t.Preset.Ser() == cur;
+                if (t.Selected != sel) { t.Selected = sel; t.Invalidate(); }
+            }
+            ShowFilterDesc(CurrentFilter());
+        }
+
+        // Carte « gros chiffre » : titre, valeur en grand, curseur, bornes.
+        ModernSlider AddTile(Control parent, int x, int y, int w, int h, string title, int min, int max, int val, string unit, Action onChange)
+        {
+            CardPanel c = Card(parent, x, y, w, h);
+            Label tl = MakeLabel(c, title, 18, 8, w - 36, Theme.Dim);
+            tl.Height = 18;
+            tl.Font = new Font("Segoe UI", 9f);
+            Font bigF = Theme.Display(24f);
+            Label num = new Label();
+            num.AutoSize = true; num.Font = bigF; num.ForeColor = Theme.Fg;
+            num.Location = new Point(14, 26);
+            c.Controls.Add(num);
+            Label un = new Label();
+            un.AutoSize = true; un.Font = new Font("Segoe UI", 11f); un.ForeColor = Theme.Dim; un.Text = unit;
+            c.Controls.Add(un);
+            ModernSlider t = new ModernSlider();
+            t.Minimum = min; t.Maximum = max; t.Value = val; t.DefaultValue = val;
+            t.SmallChange = 1; t.LargeChange = 5;
+            t.SetBounds(10, h - 44, w - 20, 28);
+            c.Controls.Add(t);
+            Label lo = MakeLabel(c, min.ToString(), 18, h - 18, 60, Theme.Dim);
+            lo.Font = new Font("Segoe UI", 8f);
+            Label hi = MakeLabel(c, max.ToString(), w - 78, h - 18, 60, Theme.Dim);
+            hi.Font = new Font("Segoe UI", 8f); hi.TextAlign = ContentAlignment.TopRight;
+            EventHandler upd = delegate
+            {
+                num.Text = t.Value.ToString();
+                int tw = TextRenderer.MeasureText(num.Text, bigF, new Size(300, 60), TextFormatFlags.NoPadding).Width;
+                un.Location = new Point(14 + tw, 38);
+                if (!loading) onChange();
+            };
+            t.ValueChanged += upd;
+            upd(null, null);
+            return t;
         }
 
         ModernSlider AddSlider(Control parent, string name, int min, int max, int val, ref int y, string fmt, Action onChange)
@@ -901,6 +1101,15 @@ namespace RustFilter
             loading = false;
         }
 
+        void UpdateChip()
+        {
+            if (stChip == null) return;
+            bool on = chkOn.Checked && !autoPaused;
+            stChip.Text = on ? "●  Filtre actif" : (autoPaused ? "●  En pause (hors jeu)" : "○  Filtre désactivé");
+            stChip.ForeColor = on ? Theme.Ok : Theme.Dim;
+            stChip.Invalidate();
+        }
+
         void ApplyNow()
         {
             if (!ready) return;
@@ -910,6 +1119,8 @@ namespace RustFilter
             else if (autoPaused) SetStatus("Hors jeu : filtre en pause.", false);
             else SetStatus(chkOn.Checked ? "Filtre applique (jeu en Borderless)." : "Filtre desactive.", false);
             try { File.WriteAllText(lastFile, cur.Ser()); } catch { }
+            UpdateChip();
+            UpdateThumbs();
         }
 
         // ===== profils =====
@@ -1082,8 +1293,15 @@ namespace RustFilter
             crossArgb = c.Argb;
             cSize.Value = Clamp(c.Size, cSize); cThick.Value = Clamp(c.Thick, cThick); cGap.Value = Clamp(c.Gap, cGap);
             cOffX.Value = Clamp(c.OffX, cOffX); cOffY.Value = Clamp(c.OffY, cOffY);
+            cOpa.Value = Clamp(c.AlphaPct, cOpa);
             chkOutline.Checked = c.Outline;
             loading = false;
+        }
+
+        static int WithAlpha(int argb, int pct)
+        {
+            Color c = Color.FromArgb(argb);
+            return Color.FromArgb((int)Math.Round(pct * 2.55), c.R, c.G, c.B).ToArgb();
         }
 
         void CrossChanged()
@@ -1092,33 +1310,64 @@ namespace RustFilter
             CrossCfg c = new CrossCfg();
             c.On = chkCross.Checked;
             c.Style = Math.Max(0, cbStyle.SelectedIndex);
-            c.Argb = crossArgb;
+            c.Argb = WithAlpha(crossArgb, cOpa.Value);
             c.Size = cSize.Value; c.Thick = cThick.Value; c.Gap = cGap.Value;
             c.OffX = cOffX.Value; c.OffY = cOffY.Value;
             c.Outline = chkOutline.Checked;
             cross.UpdateCfg(c);
             bColor.Swatch = Color.FromArgb(255, Color.FromArgb(crossArgb)); bColor.Invalidate(); preview.Cfg = c; preview.Invalidate();
+            UpdatePresetTiles(c);
             SaveConfig();
+        }
+
+        static readonly string[] PresetNames = new string[] { "Classique", "Point précis", "Croix fine", "Croix ouverte", "T discret", "Cercle jaune", "Long fin", "Gros rouge" };
+
+        // Les huit réglages les plus utiles : style, couleur, taille, épaisseur, écart (contour noir pour tous).
+        static CrossCfg[] BuildPresets()
+        {
+            int[][] p = new int[][] {
+                new int[] { 2, Color.FromArgb(0, 255, 120).ToArgb(), 6, 2, 3 },
+                new int[] { 0, Color.White.ToArgb(), 4, 3, 0 },
+                new int[] { 1, Color.White.ToArgb(), 6, 1, 2 },
+                new int[] { 1, Color.FromArgb(0, 230, 255).ToArgb(), 8, 2, 6 },
+                new int[] { 4, Color.White.ToArgb(), 8, 2, 3 },
+                new int[] { 3, Color.FromArgb(255, 220, 0).ToArgb(), 9, 2, 0 },
+                new int[] { 1, Color.FromArgb(255, 80, 200).ToArgb(), 12, 1, 4 },
+                new int[] { 2, Color.FromArgb(255, 40, 40).ToArgb(), 10, 3, 4 } };
+            CrossCfg[] r = new CrossCfg[p.Length];
+            for (int i = 0; i < p.Length; i++)
+            {
+                CrossCfg c = new CrossCfg();
+                c.On = true; c.Style = p[i][0]; c.Argb = p[i][1]; c.Size = p[i][2]; c.Thick = p[i][3]; c.Gap = p[i][4]; c.Outline = true;
+                r[i] = c;
+            }
+            return r;
         }
 
         void ApplyPreset(int i)
         {
-            if (i < 0) return;
-            //               style, couleur,                  taille, epaisseur, ecart, contour
-            int[][] p = new int[][] {
-                new int[] { 2, Color.FromArgb(0, 255, 120).ToArgb(), 6, 2, 3, 1 },
-                new int[] { 0, Color.FromArgb(255, 40, 40).ToArgb(), 4, 4, 0, 1 },
-                new int[] { 1, Color.FromArgb(0, 230, 255).ToArgb(), 8, 1, 4, 1 },
-                new int[] { 3, Color.FromArgb(255, 220, 0).ToArgb(), 10, 2, 0, 1 },
-                new int[] { 4, Color.White.ToArgb(), 7, 2, 3, 1 },
-                new int[] { 0, Color.White.ToArgb(), 2, 2, 0, 1 },
-                new int[] { 2, Color.FromArgb(255, 80, 200).ToArgb(), 12, 3, 6, 1 } };
-            int[] v = p[i];
+            if (i < 0 || i >= presetCfgs.Length) return;
             CrossCfg c = new CrossCfg();
-            c.On = true; c.Style = v[0]; c.Argb = v[1]; c.Size = v[2]; c.Thick = v[3]; c.Gap = v[4]; c.Outline = v[5] == 1;
+            CrossCfg v = presetCfgs[i];
+            c.On = true; c.Style = v.Style; c.Argb = v.Argb; c.Size = v.Size; c.Thick = v.Thick; c.Gap = v.Gap; c.Outline = v.Outline;
             c.OffX = cOffX.Value; c.OffY = cOffY.Value;
             SetCrossUi(c);
             CrossChanged();
+        }
+
+        // Entoure la vignette qui correspond aux réglages actuels.
+        void UpdatePresetTiles(CrossCfg c)
+        {
+            if (presetTiles == null) return;
+            Color cur = Color.FromArgb(c.Argb);
+            for (int i = 0; i < presetTiles.Length; i++)
+            {
+                CrossCfg v = presetCfgs[i];
+                Color pc = Color.FromArgb(v.Argb);
+                bool same = v.Style == c.Style && v.Size == c.Size && v.Thick == c.Thick && v.Gap == c.Gap && v.Outline == c.Outline
+                    && pc.R == cur.R && pc.G == cur.G && pc.B == cur.B;
+                if (presetTiles[i].Selected != same) { presetTiles[i].Selected = same; presetTiles[i].Invalidate(); }
+            }
         }
 
         void PickColor()
@@ -1274,10 +1523,17 @@ namespace RustFilter
             else if (a.StartsWith("p:")) LoadProfile(a.Substring(2), true);
         }
 
+        protected override void OnPaintBackground(PaintEventArgs e) { Theme.Backdrop(this, e.Graphics); }
+
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
             try { int on = 1; Native.DwmSetWindowAttribute(Handle, 20, ref on, 4); } catch { }
+            // Windows 11 : coins arrondis, barre de titre et bordure teintées comme l'application (ignoré sur Windows 10)
+            try { int round = 2; Native.DwmSetWindowAttribute(Handle, 33, ref round, 4); } catch { }
+            try { int cap = 9 | (14 << 8) | (24 << 16); Native.DwmSetWindowAttribute(Handle, 35, ref cap, 4); } catch { }
+            try { int txt = 233 | (237 << 8) | (245 << 16); Native.DwmSetWindowAttribute(Handle, 36, ref txt, 4); } catch { }
+            try { int brd = 38 | (49 << 8) | (71 << 16); Native.DwmSetWindowAttribute(Handle, 34, ref brd, 4); } catch { }
             RegisterAll();
         }
 
@@ -1501,6 +1757,8 @@ namespace RustFilter
             if (nat != "RUST-lcRei-H") { Console.Error.WriteLine("ECHEC code RUST : " + nat); fails++; }
             CrossCfg back = NativeCode.ToCross("crosshair.load_code RUST-lcRei-H");
             if (back.Style != 2 || back.Size != 10 || back.Thick != 2 || back.Gap != 0 || !back.Outline) { Console.Error.WriteLine("ECHEC import RUST : " + back.Ser()); fails++; }
+            CrossCfg web = CrossCfg.Parse(Codes.Dec("MTsyOzIxMzA3NzE4MzI7NjsyOzM7MTswOzA")); // code RFX produit par le site avec 50 % d opacite
+            if (web.AlphaPct != 50 || web.Style != 2 || web.Size != 6 || !web.Outline) { Console.Error.WriteLine("ECHEC opacite RFX : " + web.AlphaPct); fails++; }
             CrossCfg ref1 = NativeCode.ToCross("RUST-FceIG-b9l");
             if (ref1.Style != 4 || ref1.Argb != Color.FromArgb(255, 255, 0, 0).ToArgb() || !ref1.Outline) { Console.Error.WriteLine("ECHEC import RUST ref : " + ref1.Ser()); fails++; }
             f.Quit();
